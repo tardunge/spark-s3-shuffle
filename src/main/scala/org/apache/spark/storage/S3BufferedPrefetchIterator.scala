@@ -10,12 +10,17 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.shuffle.helper.S3ShuffleDispatcher
 
 import java.io.{BufferedInputStream, InputStream}
-import java.util
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.{LinkedBlockingDeque, TimeUnit}
+import java.util.concurrent.atomic.{AtomicLong, AtomicInteger}
 
 class S3BufferedPrefetchIterator(iter: Iterator[(BlockId, S3ShuffleBlockStream)], maxBufferSize: Long)
     extends Iterator[(BlockId, InputStream)]
     with Logging {
+  
+  // Timeout constants
+  private val MEMORY_WAIT_TIMEOUT_MS = 5000
+  private val NEXT_ELEMENT_TIMEOUT_SEC = 30
+  
   private val startTime = System.nanoTime()
 
   @volatile private var memoryUsage: Long = 0
@@ -25,9 +30,14 @@ class S3BufferedPrefetchIterator(iter: Iterator[(BlockId, S3ShuffleBlockStream)]
   private var numStreams: Long = 0
   private var bytesRead: Long = 0
 
-  private var activeTasks: Long = 0
-
-  private val completed = new util.LinkedList[(InputStream, BlockId, Long)]()
+  // Use atomic counter for thread-safe updates
+  private val activeTasks = new AtomicInteger(0)
+  
+  // Use LinkedBlockingDeque for thread-safe LIFO operations
+  private val completed = new LinkedBlockingDeque[(InputStream, BlockId, Long)]()
+  
+  // Separate lock for memory management
+  private val memoryLock = new Object()
 
   private class ThreadPredictor(maxThreads: Int) {
     private var currentThreads = 1
@@ -93,63 +103,105 @@ class S3BufferedPrefetchIterator(iter: Iterator[(BlockId, S3ShuffleBlockStream)]
   // Make sure that there's at least a single thread running.
   configureThreads(-1)
 
-  private def onCloseStream(bufferSize: Int): Unit = synchronized {
-    // Reduce the memory usage once the stream has been closed and the buffer was made available.
-    memoryUsage -= bufferSize
-    notifyAll()
+  private def onCloseStream(bufferSize: Int): Unit = {
+    memoryLock.synchronized {
+      memoryUsage -= bufferSize
+      memoryLock.notifyAll()  // Wake up threads waiting for memory
+    }
   }
 
   private def prefetchThread(threadId: Long): Unit = {
     currentActiveThreads.incrementAndGet()
     var nextElement: (BlockId, S3ShuffleBlockStream) = null
+    
     while (true) {
-      synchronized {
+      // Step 1: Get next work item (minimal lock time)
+      val shouldExit = synchronized {
         if (!iter.hasNext && nextElement == null) {
           hasItem = false
-          return
-        }
-        if (nextElement == null) {
+          true  // exit
+        } else if (nextElement == null) {
           if (threadId > desiredActiveThreads.get()) {
             currentActiveThreads.decrementAndGet()
-            return
-          }
-          nextElement = iter.next()
-          activeTasks += 1
-          hasItem = iter.hasNext
-        }
-      }
-
-      var fetchNext = false
-      val bsize = scala.math.min(maxBufferSize, nextElement._2.maxBytes).toInt
-      synchronized {
-        if (memoryUsage + bsize > maxBufferSize) {
-          try {
-            wait()
-          } catch {
-            case _: InterruptedException =>
+            true  // exit
+          } else {
+            nextElement = iter.next()
+            activeTasks.incrementAndGet()  // Increment when taking element
+            hasItem = iter.hasNext
+            false  // continue
           }
         } else {
-          fetchNext = true
-          memoryUsage += bsize
+          false  // continue - already have an element to retry
         }
       }
-
-      if (fetchNext) {
+      
+      if (shouldExit) {
+        currentActiveThreads.decrementAndGet()
+        return
+      }
+      
+      // Step 2: Wait for memory (separate lock)
+      val bsize = scala.math.min(maxBufferSize, nextElement._2.maxBytes).toInt
+      var memoryAllocated = false
+      
+      memoryLock.synchronized {
+        val deadline = System.currentTimeMillis() + MEMORY_WAIT_TIMEOUT_MS
+        var timedOut = false
+        while (memoryUsage + bsize > maxBufferSize && !timedOut) {
+          val remaining = deadline - System.currentTimeMillis()
+          if (remaining <= 0) {
+            logWarning(s"Timeout waiting for memory allocation of $bsize bytes")
+            // Continue anyway to avoid deadlock
+            timedOut = true
+          } else {
+            try {
+              memoryLock.wait(remaining)
+            } catch {
+              case _: InterruptedException =>
+            }
+          }
+        }
+        if (!timedOut) {
+          memoryUsage += bsize
+          memoryAllocated = true
+        }
+      }
+      
+      if (memoryAllocated) {
+        // Step 3: Process (no lock needed)
         val block = nextElement._1
         val s = nextElement._2
-        nextElement = null
+        nextElement = null  // Clear for next iteration
         val now = System.nanoTime()
         val stream = new S3BufferedInputStreamAdaptor(s, bsize, onCloseStream)
         timePrefetching += System.nanoTime() - now
         bytesRead += bsize
+        
+        // Step 4: Add to completed queue (thread-safe, LIFO order)
+        completed.addFirst((stream, block, bsize))
+        activeTasks.decrementAndGet()  // Decrement only after completion
+        
+        // Notify waiting consumers
         synchronized {
-          completed.push((stream, block, bsize))
-          activeTasks -= 1
+          notifyAll()
+        }
+      } else {
+        // Memory allocation timed out - process without buffer to prevent deadlock
+        logWarning(s"Memory allocation timed out for block ${nextElement._1}. Processing without buffer to prevent deadlock.")
+        val block = nextElement._1
+        val s = nextElement._2  // Raw S3ShuffleBlockStream (already an InputStream)
+        nextElement = null  // Clear for next iteration
+        
+        // Add raw stream directly without buffering (memory usage = 0)
+        completed.addFirst((s, block, 0L))
+        activeTasks.decrementAndGet()  // Decrement after completion
+        
+        // Notify waiting consumers
+        synchronized {
           notifyAll()
         }
       }
     }
-    currentActiveThreads.decrementAndGet()
   }
 
   private def printStatistics(): Unit = synchronized {
@@ -185,29 +237,38 @@ class S3BufferedPrefetchIterator(iter: Iterator[(BlockId, S3ShuffleBlockStream)]
     }
   }
 
-  override def hasNext: Boolean = synchronized {
-    val result = hasItem || activeTasks > 0 || (completed.size() > 0)
+  override def hasNext: Boolean = {
+    val result = hasItem || activeTasks.get() > 0 || !completed.isEmpty
     if (!result) {
       printStatistics()
     }
     result
   }
 
-  override def next(): (BlockId, InputStream) = synchronized {
+  override def next(): (BlockId, InputStream) = {
     val now = System.nanoTime()
-    while (completed.isEmpty) {
-      try {
-        wait()
-      } catch {
-        case _: InterruptedException =>
+    
+    // Poll with timeout instead of synchronized wait
+    var result: (InputStream, BlockId, Long) = null
+    val deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(NEXT_ELEMENT_TIMEOUT_SEC)
+    
+    while (result == null && System.currentTimeMillis() < deadline) {
+      result = completed.pollFirst(100, TimeUnit.MILLISECONDS)
+      if (result == null && !hasNext) {
+        throw new NoSuchElementException("No more elements")
       }
     }
-    val latency = System.nanoTime() - now
-    configureThreads(latency)
-    timeWaiting += latency
+    
+    if (result == null) {
+      throw new java.util.concurrent.TimeoutException(s"Timeout waiting for next element after ${NEXT_ELEMENT_TIMEOUT_SEC} seconds")
+    }
+    
+    val timeBetweenReads = System.nanoTime() - now
+    timeWaiting += timeBetweenReads
+    
+    configureThreads(timeBetweenReads)
     numStreams += 1
-    val result = completed.pop()
-    notifyAll()
-    return (result._2, result._1)
+    
+    (result._2, result._1)
   }
 }

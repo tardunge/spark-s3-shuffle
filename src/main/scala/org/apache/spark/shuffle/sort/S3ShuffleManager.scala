@@ -28,9 +28,9 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.shuffle._
 import org.apache.spark.shuffle.api.ShuffleExecutorComponents
 import org.apache.spark.shuffle.helper.{S3ShuffleDispatcher, S3ShuffleHelper}
-import org.apache.spark.storage.S3ShuffleReader
+import org.apache.spark.storage.{BlockManager, S3ShuffleReader}
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.collection.mutable
 
 /** This class was adapted from Apache Spark: SortShuffleManager.scala
@@ -131,14 +131,26 @@ private[spark] class S3ShuffleManager(conf: SparkConf) extends ShuffleManager wi
           shuffleExecutorComponents
         )
       case bypassMergeSortHandle: BypassMergeSortShuffleHandle[K @unchecked, V @unchecked] =>
-        new BypassMergeSortShuffleWriter(
+        // Use reflection to instantiate BypassMergeSortShuffleWriter due to package-private visibility
+        // when loaded via --packages from external repository
+        val clazz = Class.forName("org.apache.spark.shuffle.sort.BypassMergeSortShuffleWriter")
+        val constructor = clazz.getDeclaredConstructor(
+          classOf[BlockManager],
+          classOf[BypassMergeSortShuffleHandle[_, _]],
+          classOf[Long],
+          classOf[SparkConf],
+          classOf[ShuffleWriteMetricsReporter],
+          classOf[ShuffleExecutorComponents]
+        )
+        constructor.setAccessible(true)
+        constructor.newInstance(
           env.blockManager,
           bypassMergeSortHandle,
-          mapId,
+          Long.box(mapId),
           env.conf,
           metrics,
           shuffleExecutorComponents
-        )
+        ).asInstanceOf[ShuffleWriter[K, V]]
       case other: BaseShuffleHandle[K @unchecked, V @unchecked, _] =>
         new SortShuffleWriter(other, mapId, context, metrics, shuffleExecutorComponents)
     }
